@@ -1,0 +1,4 @@
+name = Audiopush Server
+description = Audio-push.com XMLRPC service. Converts Nodes to promoted MP3 podcasts for backlinks.
+package = * Site Promotion
+core = 6.x

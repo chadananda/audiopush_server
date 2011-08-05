@@ -1,0 +1,104 @@
+<?php
+
+/**
+ * Implementation of hook_install().
+ */
+function mp3service_install() {
+  drupal_install_schema('mp3service'); 
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function mp3service_uninstall() {
+  drupal_uninstall_schema('mp3service');
+}
+
+/**
+ * Get our schema all set up
+ */
+function mp3service_schema() {
+
+  $schema['mp3service'] = array(
+    'description' => t('mp3 service table to track job status'),
+    'fields' => array(
+      'uuid' => array(
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+        'description' => t('unique identifier for mp3 conversion jobs'),
+      ),
+      'text' => array(
+        'type' => 'blob',
+        'size' => 'big',
+        'not null' => TRUE,
+        'description' => t('content to be converted'),        
+      ),            
+      'assigned_to' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',        
+        'description' => t('session id for the process doing the conversion'),        
+      ),
+      'statustime' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => '0',
+        'description' => t('timestamp when last status change occurred'),                
+      ),
+      'state' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => t('workflow state that the job is in'),                
+      ),            
+      'voice' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',        
+        'description' => t('Voice used for this job'),        
+      ),
+      'hash' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',        
+        'description' => t('MD5 hash of body text'),        
+      ),
+    ),
+    'primary key' => array('uuid'),
+  );
+  
+  // Access control table
+  $schema['mp3service_access'] = array(
+    'description' => t('manage access tokens for mp3 service'),    
+    'fields' => array(
+      'id' => array(
+        'type' => 'serial',
+        'not null' => TRUE,
+        'description' => t('unique identifier for this record'),        
+      ),    
+      'token' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+        'description' => t('access token to authenticate user'),                
+      ),
+      'desc' => array(
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+        'description' => t('text description for the token'),                
+      ),      
+    ),
+    'primary key' => array('id'),
+  );
+
+  return $schema;
+}

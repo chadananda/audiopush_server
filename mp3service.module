@@ -1,0 +1,834 @@
+<?php
+
+require_once(drupal_get_path('module', 'mp3service') .'/util.php');
+//require_once(drupal_get_path('module', 'mp3service') .'/public.php'); 
+
+//define("MP3SERVICE_STATE_CREATED", 0);
+define("MP3SERVICE_STATE_PENDING", 1);
+define("MP3SERVICE_STATE_ASSIGNED", 7);
+define("MP3SERVICE_STATE_COMPLETE", 2);
+define("MP3SERVICE_STATE_ERROR", 3);
+define("MP3SERVICE_STATE_OVERRIDE", 4);
+
+define('MP3SERVICE_ERROR_ACCESS', 10);
+define('MP3SERVICE_ERROR_DUPE', 11);
+define('MP3SERVICE_ERROR_LENGTH', 12);
+define('MP3SERVICE_ERROR_CONFLICT', 13);
+
+/**
+ * Implementation of hook_xmlrpc().
+ *
+ * Referenced functions are found in public.php
+ */
+function mp3service_xmlrpc() {
+
+  // website-facing
+  $methods[] = array(
+  	'mp3service.submitNode',
+  	'mp3service_xmlrpc_submitnode',
+  );
+  $methods[] = array(
+	  'mp3service.checkNode',
+  	'mp3service_xmlrpc_checknode',
+  );
+  $methods[] = array(
+	  'mp3service.submitPodcast',
+  	'mp3service_xmlrpc_submitpodcast',
+  );
+
+  $methods[] = array(
+	  'mp3service.testToken',
+  	'mp3service_xmlrpc_testtoken',
+  );
+
+
+  
+  // converter-facing
+  $methods[] = array(
+  	'mp3service.requestJob',
+  	'mp3service_xmlrpc_requestjob',
+  );
+  $methods[] = array(
+  	'mp3service.submitJob',
+  	'mp3service_xmlrpc_submitnodejob',
+  );
+
+
+
+
+  /** FAKE METHODS FOR TESTING **/
+/*
+  // website-facing
+  $methods[] = array(
+  	'fake.submit',
+  	'mp3service_fakerpc_submit',
+  );
+  $methods[] = array(
+	  'fake.check',
+  	'mp3service_fakerpc_check',
+  );
+  
+  // minion-facing
+  $methods[] = array(
+  	'fake.requestJob',
+  	'mp3service_fakerpc_requestjob',
+  );
+  $methods[] = array(
+  	'fake.submitJob',
+  	'mp3service_fakerpc_submitjob',
+  );
+
+*/
+
+  
+  return $methods;
+}
+
+/**
+ * Implementation of hook_menu()
+ */
+function mp3service_menu() {
+  $items = array();
+  
+  $items['admin/settings/mp3service'] = array(
+    'title' => t('AudioPush Server'),
+    'description' => t('Settings for mp3 conversion service'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mp3service_admin_settings_form', NULL),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  $items['mp3service/delete/access'] = array(
+    'title' => t('MP3 Service Job Delete'),
+    'description' => t('Delete conversion jobs'),
+    'page callback' => 'mp3service_access_delete',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['mp3service/delete/job'] = array(
+    'title' => t('MP3 Service Job Delete'),
+    'description' => t('Delete job in queue'),
+    'page callback' => 'mp3service_job_delete',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_CALLBACK,
+  );  
+  $items['mp3service/retry/job'] = array(
+    'title' => t('MP3 Service Retry Job'),
+    'description' => t('Retry job in queue'),
+    'page callback' => 'mp3service_job_retry',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_CALLBACK,
+  );  
+  $items['admin/settings/mp3service/settings'] = array(
+    'title' => t('Settings'),
+    'description' => t('Settings for mp3 conversion service'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mp3service_admin_settings_form', NULL),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'weight' => -1,
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+  $items['admin/settings/mp3service/table'] = array(
+    'title' => t('Job Queue'),
+    'description' => t('Manage mp3 service queue'),
+    'page callback' => 'mp3service_admin_table',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type'  => MENU_LOCAL_TASK,
+  );  
+  $items['admin/settings/mp3service/access'] = array(
+    'title' => 'Access Controls',
+    'description' => t('Manage mp3 service access tokens'),    
+    'page callback' => 'mp3service_admin_access',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  $items['mp3service/view_audioformat'] = array(
+    'title' => t('MP3service View Audioformat'),
+    'description' => t('View node as rendered by audio template'),
+    'page callback' => 'mp3service_format_node_audio', 
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_CALLBACK,
+  );  
+  
+  return $items;  
+}
+
+/**
+ * Implementation of hook_simpletest().
+ */
+function mp3service_simpletest() {
+
+  $dir = drupal_get_path('module', 'mp3service') .'/tests';
+  $tests = file_scan_directory($dir, '\.test$');
+  return array_keys($tests);
+}
+
+
+/**
+ * Notification Check for available minion, sends periodic email notifications if no minion
+ */
+function mp3service_minion_check(){ 
+  // warn if no minion calls 
+  if (variable_get('mp3service_last_minion_call', 0) < strtotime('20 minutes ago')) {
+   if (variable_get('mp3service_minion_notify', 0) < strtotime('3 hours ago')) {
+    $work_count = db_result(db_query('SELECT count(*) FROM {mp3service} WHERE state=%d', MP3SERVICE_STATE_PENDING));
+    if ($work_count && ($email = variable_get('site_mail', ''))) {
+     // send notification email 
+     $subject = "Warning, no conversion minion activity.";
+     $body = ' '. date("F j, Y, g:i a") ."\n\n Warning from {$GLOBALS['base_url']}: \n  No conversion minion activity detected and {$work_count} jobs in pending state.";
+     mail($email, $subject, $body);
+     variable_set('mp3service_minion_notify', time());
+    }
+	 }
+  } 
+}
+
+/**
+ * Implementation of hook_cron()
+ */
+function mp3service_cron() {
+
+  // make sure a minion is working, sends an hourly email notification if no minion activity
+  mp3service_minion_check();
+
+  // TODO this is for devel, disable in prod
+  menu_rebuild();  
+    
+  $timedout = array();
+  $completed = array();
+  $errored = array();
+
+	$ret = db_query("SELECT uuid,state,statustime FROM {mp3service}");
+	while($obj = db_fetch_object($ret)) {
+		$last_update = strtotime($obj->statustime);
+		$now = time();
+		switch ($obj->state) {
+			case MP3SERVICE_STATE_PENDING:
+			case MP3SERVICE_STATE_ASSIGNED:
+				$diff = strtotime(variable_get('mp3service_timeout', 0) . " minutes ago", $now);
+				if ($obj->statustime < $diff) {
+					$timedout[] = $obj->uuid;
+				}			
+				break;
+			case MP3SERVICE_STATE_COMPLETE:
+				$diff = strtotime(variable_get('mp3service_purgetime', 0) . " hours ago", $now);
+				if ($obj->statustime < $diff) {
+					$completed[] = $obj->uuid;
+				}			
+				break;
+			case MP3SERVICE_STATE_ERROR:		
+				$diff = strtotime(variable_get('mp3service_purgetime', 0) . " hours ago", $now);
+				if ($obj->statustime < $diff) {
+					$errored[] = $obj->uuid;
+				}						
+				break;
+		}
+	}
+
+/*
+	if (count($timedout) > 0)	
+		_mp3service_reassign($timedout, 'timeout');
+	if (count($completed) > 0)	
+  	_mp3service_purge($completed, 'complete');
+	if (count($errored) > 0)
+  	_mp3service_purge($errored, 'error');
+*/
+}
+
+/**
+ * Admin settings form
+ */
+function mp3service_admin_settings_form() {
+  $form['mp3service_filesdir'] = array(
+    '#type'     => 'textfield',
+    '#title'    => t('MP3 Files Subdirectory'),
+    '#default_value' => variable_get('mp3service_filesdir', 'mp3service'),
+    '#description'  => t('Where to store converted MP3 files (under ' . file_directory_path() . ')'),
+  );  
+
+  $form['mp3service_max_article_len'] = array(
+    '#type'     => 'textfield',
+    '#title'    => t('Maximum article length'),
+    '#default_value' => variable_get('mp3service_max_article_len', 40000),
+    '#description'  => t('How many characters for the maximum article length'),
+  );  
+
+  $form['mp3service_timeout'] = array(
+    '#type'     => 'select',
+    '#title'    => t('Converter timeout'),
+    '#default_value' => variable_get('mp3service_timeout', 2),
+    '#options'  => array (
+      0   => t('None'),
+      1   => t('1 minute'),     
+      2   => t('2 minutes'),
+      5   => t('5 minutes'),
+      10  => t('10 minutes'),
+      15  => t('15 minutes'),
+      30  => t('30 minutes'),      
+      60  => t('1 hour'),            
+      120  => t('2 hours'),                  
+    ),
+    '#description' => t('Delay between sending a job to a converter and reassigning the job'),
+  );  
+  $form['mp3service_purgetime'] = array(
+    '#type'     => 'select',
+    '#title'    => t('Purge delay'),
+    '#default_value' => variable_get('mp3service_purgetime', 4),
+    '#options'  => array (
+      0 => t('None'),
+      1	=> t('1 hour'),
+      2	=> t('2 hours'),
+      4	=> t('4 hours'),
+      8	=> t('8 hours'),      
+      16 => t('16 hours'),            
+      24 => t('1 day'),
+      168 => t('1 week'),
+      336 => t('2 weeks'),
+      672 => t('4 weeks'),                  
+    ),
+    '#description'  => t('Delay before purging completed records'),
+  );  
+  $form['mp3service_default_voice'] = array(
+    '#type'     => 'select',
+    '#title'    => t('Default voice'),
+    '#default_value' => variable_get('mp3service_default_voice', 'Crystal'),
+    '#options'  => _mp3service_voices(),
+    '#description' => t('Select the default voice for mp3 conversion'),
+  );    
+
+  return system_settings_form($form); 
+}
+
+/**
+ * Manage items in mp3 conversion process
+ */
+function mp3service_admin_table() {
+
+	global $mp3states;
+
+  $header = array(
+    array(
+      'data'  => t('UUID'),
+      'field' => 'uuid', 
+    ),
+    array(
+      'data'  => t('Text formatted for Audio Engine'),
+      'field' => 'text', 
+    ),
+    array(
+      'data'  => t('Assigned to:'),
+      'field' => 'assigned_to', 
+    ),
+    array(
+      'data'  => t('Statustime'),
+      'field' => 'statustime',
+      'sort'  => 'asc'
+    ),
+    array(
+      'data'  => t('State'),
+      'field' => 'state', 
+    ),
+  /*   
+    array(
+      'data'  => t('Delete'),
+    ),
+    array(
+      'data'  => t('Retry'),
+    ),*/
+  ); 
+  
+  $rows = array();
+  $ret = db_query('SELECT * FROM {mp3service} ORDER BY statustime DESC');
+  while ($row = db_fetch_object($ret)) {
+  
+  	if(strlen($row->text) > 200) {
+      $text = htmlEntities(mp3service_filtertags(substr($row->text, 0, 100)));
+      $text = wordwrap($text, 50, "<br>\n", TRUE); 
+  		$text = $text .'...';
+  	}
+  	else {
+  		$text = $row->text;
+  	}
+  
+    $rows[] = array(
+      l($row->uuid, "mp3service/view_audioformat/" . $row->uuid, array('attributes' =>array('target'=>'_blank'))),  
+      $text,
+      $row->assigned_to, 
+      date("F j g:ia",$row->statustime),
+      _mp3service_state_name($row->state), 
+     // l($row->uuid, "mp3service/view/" . $row->uuid), 
+     /* l('[X]', "mp3service/delete/job/" . $row->uuid),
+      l('[R]', "mp3service/retry/job/" . $row->uuid),   */  
+    );
+  }
+
+
+  if ($lm = variable_get('mp3service_last_minion_call', 0)) $lastminion = date('l F j Y, g:i a', $lm);
+   else $lastminion = '<span style="color:maroon">none</span>';
+  drupal_set_message("Last minion contact: <b> $lastminion </b>");
+   
+   
+  if ($ls = variable_get('mp3service_last_site_call', 0)) $lastsite = date('l F j Y, g:i a', $ls);
+   else $lastsite = '<span style="color:maroon">none</span>';
+  drupal_set_message("Last client site request: <b>$lastsite</b>");
+
+  return  theme('table', $header, $rows, array(), t('MP3 Conversion Queue'));
+}
+
+/**
+ *  Format node text as it will be output to the audio engine
+ */  
+function mp3service_format_node_audio($uuid=0){
+ if (!$uuid) $uuid = arg(2);
+ //return '<h1>'. $uuid .'</h1>'; 
+ $text = db_result(db_query("SELECT text FROM {mp3service} WHERE uuid='%s'", array($uuid)));
+ if (!$text) return FALSE; 
+ $text = mp3service_filtertags($text); 
+ //$text = htmlentities($text);
+ //$text = str_replace(array("\r","\n"), "<br>", $text);
+ //$text = "<pre> $text </pre>";
+ echo '<textarea style="width:100%; height: 800px">'. $text .'</textarea>';
+ die;
+ return $text;
+}
+
+ 
+
+/*
+ * This is the filter that strips out tags which cannot be read by our speach engine... maybe all tags
+ */
+function mp3service_filtertags($html){ 
+
+ // strip out links from html
+// $html = strip_tags($html, '<ul><ol><p><li><div><h1><h2><h3><h4><h5><b><i><tt><strong><em><pre>');
+
+ $html = '[br]'.trim($html); 
+ 
+ $html = str_replace("\n\n", "[br]", $html); 
+ $html = str_replace('<br', "[br]<br", $html);
+ 
+
+ // next, add pauses at common break points
+ $html = str_replace('<p', "[br]<p", $html);
+ $html = str_replace('<h', "[br]<h", $html);
+ $html = str_replace('<li', "[br]<li", $html);
+ $html = str_replace('<li', "[br]<li", $html);
+
+ // change voice insertions
+ $html = str_replace('<h', "[br]<h", $html);
+ // $html = str_replace('</h', "[change_voice]</h", $html); 
+ $html = str_replace('<p', "[br]<p", $html);
+  
+// return $html;
+
+ // remove any remaining tags
+ $html = strip_tags($html);
+ $html = str_replace("\n", " ", $html); $html = str_replace("\r", " ", $html); 
+ $html = str_replace('[br]  ', "[br]", $html); $html = str_replace('[br] ', "[br]", $html);
+ $html = str_replace('[br][br][br]', "[br]", $html); $html = str_replace('[br][br]', "[br]", $html);
+ $html = str_replace('[br]', "\n\n[pause][pause][change_voice]", $html); 
+
+ // fix pronunciation oddities
+ $html = str_replace('http://', '[pause] H T T P ', $html);
+ $html = str_replace('.com', " dot com", $html);
+ $html = str_replace('.info', " dot info", $html);
+ $html = str_replace('.net', " dot net", $html);
+ $html = str_replace('.edu', " dot E D U", $html);
+ $html = str_replace('LED ', "L E D ", $html);
+ $html = str_replace('iPhone', "eye phone", $html);
+ $html = str_replace('login', "log in", $html);
+ $html = str_replace("softwares", "software", $html);
+
+ $html = str_replace(': ', ": [pause] ", $html);
+ $html = str_replace('. ', ". [pause][pause] ", $html);
+ $html = str_replace('! ', "! [pause][pause] ", $html);
+ $html = str_replace('? ', "? [pause][pause] ", $html);
+ $html = str_replace(', ', ": [pause] ", $html);
+ $html = str_replace(') ', ") [pause] ", $html);  
+
+ return trim($html);
+}
+
+function mp3service_access_table() {
+  $header = array(
+    array(
+      'data'  => t('Token'),
+      'field' => 'token',
+      'sort'  => 'asc'
+    ),
+    array(
+      'data'  => t('Description'),
+      'field' => 'desc',
+      'sort'  => 'asc'
+    ),
+
+
+    array(
+      'data'  => t('Delete'),
+    ),
+
+
+  );
+  
+  $rows = array();
+  $ret = db_query('SELECT * FROM {mp3service_access}');
+  while ($row = db_fetch_object($ret)) {
+    $rows[] = array(
+      $row->token, 
+      $row->desc,
+    //  l('view text', "mp3service/view/" . $row->id), 
+      l('[X]', "mp3service/delete/access/" . $row->id),
+    );
+  }
+  
+  return theme('table', $header, $rows, array(), t('MP3 Access Tokens'));
+}
+
+/**
+ * Manage mp3 service access controls
+ */
+function mp3service_admin_access() {
+  $out = drupal_get_form('mp3service_access_form');
+  $out .= mp3service_access_table();
+  
+  return $out;
+}
+
+/**
+ * Present a way to add auth tokens.
+ */
+function mp3service_access_form() {
+  $form['mp3service_access_token'] = array(
+      '#type'     => 'textfield',
+      '#title'    => t('Access Token'),
+      '#default_value' => uniqid(),
+      '#required' => true,
+      '#description'  => t('Autogenerated access token for a converter.'),    
+  );
+  $form['mp3service_access_desc'] = array(
+      '#type'     => 'textfield',
+      '#title'    => t('Description'),
+      '#default_value' => '',
+      '#required' => true,
+      '#description'  => t('Notes about converter associated with this token'),   
+  );  
+  $form['buttons']['submit'] = array('#type' => 'submit', '#value' => t('Add Access Token'));
+  return $form;   
+}
+
+/**
+ * Validate submission of new access tokens
+ */
+function mp3service_access_form_validate($form_id, $form_values) {
+}
+
+/**
+ * Install new access tokens
+ */
+function mp3service_access_form_submit($form_id, $form_values) {
+  db_query("INSERT INTO {mp3service_access} VALUES (0,'%s','%s')",
+    array($form_values['values']['mp3service_access_token'], $form_values['values']['mp3service_access_desc']));
+}
+
+/**
+ * Callback to support deleting access tokens
+ */
+function mp3service_access_delete() {
+
+  $tokenid = (int) arg(3);
+  
+  if (is_int($tokenid) && $tokenid > 0) {
+    db_query("DELETE FROM {mp3service_access} WHERE id=%d", array($tokenid));
+  }
+  else {
+    form_set_error('access delete', t('Error deleting access token'));
+  }
+  drupal_goto('admin/settings/mp3service/access');
+}
+
+/**
+ * Callback to support deleting jobs from queue
+ */
+function mp3service_job_delete() {
+
+  $uuid = arg(3);
+  if (ctype_alnum($uuid)) {
+    db_query("DELETE FROM {mp3service} WHERE uuid='%s'", array($uuid));
+  }
+  else {
+    form_set_error('job delete', t('Error deleting conversion job'));
+  }
+  drupal_goto('admin/settings/mp3service/table');
+}
+
+/**
+ * Callback to support deleting jobs from queue
+ */
+function mp3service_job_retry() {
+
+  $uuid = arg(3);
+  if (ctype_alnum($uuid)) {
+    db_query("UPDATE {mp3service} SET state=%d WHERE uuid='%s'", 
+    	array(MP3SERVICE_STATE_PENDING,$uuid));
+  }
+  else {
+    form_set_error('job retry', t('Error retrying conversion job'));
+  }
+  drupal_goto('admin/settings/mp3service/table');
+}
+
+
+/*******************************************************************************
+ * XMLRPC METHODS
+*******************************************************************************/
+
+/**
+ * Allows website to submit text for conversion. Exposed as XMLRPC.
+ * @param token being offered as authentication
+ * @param uuid identifying the job being submitted
+ * @param text string representing the content to be converted
+ */
+function mp3service_xmlrpc_submitnode($authtoken, $uuid, $text, $voice = 'Crystal16') {
+
+	if (!_mp3service_authenticate($authtoken)) {
+		watchdog('mp3service', 
+			t('Submit with invalid auth token (@token) rejected', array('@token' => $authtoken)));
+		return xmlrpc_error(MP3SERVICE_ERROR_ACCESS, t('Access denied: your authentication token is unknown.'));
+	}
+
+  
+	if (_mp3service_exists($uuid, $text)) {
+		watchdog('mp3service', 
+			t('Submit with duplicate uuid (@uuid) rejected', array('@uuid' => $uuid)));
+		return xmlrpc_error(MP3SERVICE_ERROR_DUPE, t('Node already submitted.'));
+	}
+	
+	if (!_mp3service_valid_voice($voice)) {
+    $oldvoice = $voice;
+    $voice = variable_get('mp3service_default_voice', 'Crystal16');
+    watchdog('mp3service', t("Requested voice @oldvoice unknown, using default @voice instead"), array('@oldvoice' => $oldvoice, '@voice' => $voice));
+	} 
+	
+	if (strlen($text) > _mp3service_max_article_len()) {
+		watchdog('mp3service', 
+			t('Article @uuid is too long (@len): rejected', array('@uuid' => $uuid, '@len' => strlen($text))));
+		return xmlrpc_error(MP3SERVICE_ERROR_LENGTH, t('Submitted text length too long, must be less than @len characters.', array('@len' => _mp3service_max_article_len())));	
+	}
+	
+  // delete existing uuid record in case an old one exists as this is a new request
+  db_query("DELETE FROM {mp3service} WHERE uuid='%s'", $uuid);
+  db_query("INSERT INTO {mp3service} (uuid, text, statustime, state, voice) VALUES ('%s', '%s', %d, %d, '%s')", 
+		array($uuid, $text, time(), MP3SERVICE_STATE_PENDING, $voice));
+
+	watchdog('debug', t('Job @uuid is now in the PENDING state', array('@uuid' => $uuid))); 
+	return array(
+		'state' => MP3SERVICE_STATE_PENDING, 
+		'desc' => t('Job @uuid is now in the PENDING state', array('@uuid' => $uuid))
+	);
+}
+
+
+/**
+ * Each time the podcast file is rebuild, its URL is submitted for promotion. 
+ * This function is exposed as an XMLRPC method.
+ * @param authtoken being offered as authentication
+ * @param podcast_url the URL to promote
+ * @return job state and if complete, the contents of the converted file
+ */
+function mp3service_xmlrpc_submitpodcast($authtoken, $podcast_url) {
+	if (!_mp3service_authenticate($authtoken)) {
+		watchdog('mp3service', 
+			t('Submit with invalid auth token (@token) rejected', array('@token' => $authtoken)));
+		return xmlrpc_error(MP3SERVICE_ERROR_ACCESS, t('Access denied: your authentication token is unknown.'));
+	}
+
+  drupal_set_message('Podcast URL recieved by AudioPush server: ' .l($podcast_url));
+
+
+ // let's implement this later
+
+ // save to task list
+ // provide an initial task list page with a list of promotion tasks and ability to mark
+ //  a url ad promoted
+
+ // after promoting a url, an email notification should go to the account owner
+ // telling them that we have promoted their podcasts
+
+}
+
+
+/**
+ * Connection test. 
+ * This function is exposed as an XMLRPC method.
+ * @param authtoken being offered as authentication 
+ */
+function mp3service_xmlrpc_testtoken($authtoken) { 
+  variable_set('mp3service_last_site_call', time()); 
+  
+	if (!_mp3service_authenticate($authtoken)) {
+		watchdog('mp3service', 
+			t('Submit with invalid auth token (@token) rejected', array('@token' => $authtoken)));
+		return xmlrpc_error(MP3SERVICE_ERROR_ACCESS, t('Access denied: your authentication token is unknown.'));
+	}
+  return TRUE;
+}
+ 
+
+
+/**
+ * Website uses this to poll for conversion completion.  
+ * This function is exposed as an XMLRPC method.
+ * @param token being offered as authentication
+ * @param uuid identifying the job being submitted
+ * @return job state and if complete, the contents of the converted file
+ */
+function mp3service_xmlrpc_checknode($authtoken, $uuid) {
+  
+	if (!_mp3service_authenticate($authtoken)) {
+		watchdog('mp3service', 
+			t('Check with invalid auth token (@token) rejected', array('@token' => $authtoken)));
+		return xmlrpc_error(MP3SERVICE_ERROR_ACCESS, t('Access denied: your authentication token is unknown.'));
+	}
+	 
+	if (!_mp3service_exists($uuid)) {
+		return xmlrpc_error(MP3SERVICE_ERROR_DNE, t('Requested UUID does not exist.'));
+	}
+	
+	$state = _mp3service_get_state($uuid);
+	if ($state != MP3SERVICE_STATE_COMPLETE) {
+  	watchdog('debug', 'check not complete returning state ' . $state);
+		return array('state' => $state);
+	}	
+	
+	$file = _mp3service_get_file($uuid);
+	$mp3data = file_get_contents($file);
+	
+	// get keywords and duration at this point
+	/*
+	 $ratio = 60000000; //128K, stereo, a meg a minute, give or take...
+$filesize = filesize($mp3);
+$duration = $filesize / $ratio;
+$minutes = floor($duration / 60);
+$seconds = $duration - ($minutes * 60);
+echo "$minutes:$seconds minutes";
+	*/
+	
+	
+	watchdog('debug', 'check returning state ' . $state . ' and file ' . $file);
+
+	return array('state' => $state, 'file' => base64_encode($mp3data));
+}
+
+/**
+ * Conversion processes use this to request new work.  Exposed as XMLRPC.
+ * @param token being offered as authentication
+ * @param sessid to identify this connection
+ */
+function mp3service_xmlrpc_requestjob($authtoken, $sessid) {  
+
+	if (!_mp3service_authenticate($authtoken)) {
+		watchdog('mp3service', t('Requestjob with invalid auth token (@token) rejected', array('@token' => $authtoken)));
+		return xmlrpc_error(MP3SERVICE_ERROR_ACCESS, t('Access denied: your authentication token is unknown.'));
+	}
+
+  variable_set('mp3service_last_minion_call', time());
+
+  // reset state of minion jobs to pending if not completed within 10 minutes
+  db_query('UPDATE {mp3service} SET state=%d, statustime=%d WHERE state=%d AND statustime<%d',
+   array(MP3SERVICE_STATE_PENDING, time(), MP3SERVICE_STATE_ASSIGNED, strtotime('10 minutes ago')));
+		
+  /*
+  // Right now this breaks badly
+if (_mp3service_count_minion_jobs($sessid) > 0) {
+    watchdog('mp3service', t('Minon @m requested another job, but is already busy with @jobs', array('@m' => $sessid, '@jobs' => implode(', ', _mp3service_get_minion_jobs($sessid)))));
+	  return xmlrpc_error(MP3SERVICE_ERROR_CONFLICT, t('This minion is already working on a job and cannot request another'));	
+	} */
+
+  // pick the oldest from the list 	
+  $ret = db_query('SELECT * FROM {mp3service} WHERE state=%d ORDER BY statustime ASC LIMIT 1', array(MP3SERVICE_STATE_PENDING)); 
+  if ($row = db_fetch_object($ret)) { 
+		db_query("UPDATE {mp3service} SET state=%d, statustime=%d, assigned_to='%s' WHERE uuid='%s'",
+			 array(MP3SERVICE_STATE_ASSIGNED, time(), $sessid, $row->uuid));	
+		return array('jobuuid' => $row->uuid, 'jobtext' => mp3service_filtertags($row->text), 'voice' => $row->voice);
+	}	
+	else return array('jobuuid' => 0, 'jobtext' => t('Job queue is empty')); 
+} 
+ 
+
+/**
+ * Conversion processes use this to return conversion results.  This function is
+ * exposed as an XMLRPC method.
+ * @param token being offered as authentication
+ * @param uuid identifying the job being submitted
+ * @param sessid identifying the converter doing the job
+ * @param mp3data mp3file in base64 encoding
+ * @return boolean representing upload success or failure
+ */
+function mp3service_xmlrpc_submitnodejob($authtoken, $uuid, $sessid, $mp3data) { 
+
+	if (!_mp3service_authenticate($authtoken)) {
+		watchdog('mp3service', t('Requestjob with invalid auth token (@token) rejected', array('@token' => $authtoken)));
+		return xmlrpc_error(MP3SERVICE_ERROR_ACCESS, t('Access denied: your authentication token is unknown.'));
+	}
+	
+	$ret = db_query("SELECT state FROM {mp3service} WHERE uuid='%s' AND assigned_to='%s' AND state=%d",
+		array($uuid, $sessid, MP3SERVICE_STATE_ASSIGNED));	
+	if (db_affected_rows() > 0) {
+		$mp3file = _mp3service_get_file($uuid);
+    $ret = file_put_contents($mp3file, base64_decode($mp3data));
+    watchdog('debug', 'wrote ' . $ret . ' bytes to output file');
+
+		if (!$ret) {
+			_mp3service_error(t("Unable to write mp3 output file", array('@sessid' => $sessid, '@uuid' => $uuid)));
+			return FALSE;
+		}
+	
+		// success
+    db_query("UPDATE {mp3service} SET state=%d, statustime=%d WHERE uuid='%s'",
+				array(MP3SERVICE_STATE_COMPLETE, time(), $uuid));
+				
+		return TRUE;
+	}	
+
+	watchdog('mp3service', 
+		t("Converter with session id (@sessid) attempted to submit non-assigned or completed job (@uuid)", array('@sessid' => $sessid, '@uuid' => $uuid)));
+			
+	return false;
+}
+
+/*******************************************************************************
+ * END XMLRPC METHODS
+*******************************************************************************/
+
+
+/** Fake Methods for testing the client against **/
+
+function mp3service_fakerpc_submit($authtoken, $uuid, $text, $voice = 'Crystal16') {
+  watchdog('debug', "fake submit args: $authtoken, $uuid, $text, $voice");
+
+	return array(
+		'state' => MP3SERVICE_STATE_PENDING, 
+		'desc' => t('Job @uuid is now in the PENDING state', array('@uuid' => $uuid))
+	);  
+}
+
+function mp3service_fakerpc_check($authtoken, $uuid) {
+  watchdog('debug', "fake check args: $authtoken, $uuid");
+  return array('state' => 2, 'file' => base64_encode('Yoursphere Media'));
+}
+
+function mp3service_fakerpc_requestJob($authtoken, $sessid) {
+  return array('jobuuid' => 'fakefake', 'jobtext' => 'Yoursphere Media', 'voice' => 'Crystal16');
+}
+
+function mp3service_fakerpc_submitJob($authtoken, $uuid, $sessid, $mp3data) {
+  return true;
+}

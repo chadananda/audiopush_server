@@ -1,0 +1,82 @@
+<?php
+
+class MP3ServiceTestCase extends DrupalWebTestCase {
+
+  function getInfo() {
+    return array(
+      'name'  => t('MP3 Service'),
+      'description'  => t('Executes test suite for mp3 conversion service module.'),
+      'group' => t('Yoursphere Tests'),
+    );
+  }
+
+  function setUp() {  
+    parent::setUp('mp3service');
+  }
+  
+  function tearDown() {
+    parent::tearDown();
+  }
+  
+	/**
+	 * Tests to exercise the mp3client api
+	 */ 
+  function testMp3ServiceAPI() {
+  
+  	$uuid = uniqid();
+  	$sessid = uniqid();
+  	$text = "There is a theory which states that if ever anybody discovers exactly what the Universe is for and why it is here, it will instantly disappear and be replaced by something even more bizarre and inexplicable. There is another theory which states that this has already happened.";
+  	$token = 'feedfacedeadbeef';
+  	$voice = 'sam';  // TODO exercise with non-default voices!
+  	
+  	// give the test user some access
+  	_mp3service_authorize($token, 'simpletest access token');
+  	$this->assertTrue(_mp3service_authenticate($token), t('Authorized token is valid'));
+  	$this->assertFalse(_mp3service_authenticate('deadbeefbabecafe'), t('Unauthorized token is invalid'));
+    	
+  	// populate job queue with some test data
+		$ret = mp3service_xmlrpc_submit($token, $uuid, $text, $voice);
+		$this->assertEqual($ret['state'], MP3SERVICE_STATE_PENDING, t('Adding a job returns expected state'));
+		$this->assertNotNull($ret['desc'], t('Adding a job returns descriptive string'));
+  
+  	// simulate a converter taking the job
+  	$job = mp3service_xmlrpc_requestjob($token, $sessid);
+  	$this->assertTrue($job['jobuuid'] == $uuid, t('Converter-side request returns expected UUID'));
+  	$this->assertTrue($job['jobtext'] == $text, t('Converter-side request returns expected text'));
+  	$this->assertTrue($job['voice'] == $voice, t('Converter-side request returns expected voice'));
+
+		// now there is nothing in the queue, so we should get nothing back here
+		$job = mp3service_xmlrpc_requestjob($token, $sessid);
+  	$this->assertEqual($job['jobuuid'], 0, t('Empty job queue request returns 0 UUID'));
+  	$this->assertNotNull($job['jobtext'], t('Empty job queue request returns descriptive text'));
+  	  	
+		// simulate converter posting completed job
+		$mp3data = base64_encode($text);
+  	$ret = mp3service_xmlrpc_submitjob($token, $uuid, $sessid, $mp3data);
+  	$this->assertTrue($ret, t('Submitjob returns success'));		
+		// resubmit after successful and submit of invalid uuid and sessid should fail 
+		$ret = mp3service_xmlrpc_submitjob($token, $uuid, $sessid, $mp3data);
+  	$this->assertFalse($ret, t('Submitjob rejects on resubmit'));		
+		$ret = mp3service_xmlrpc_submitjob($token, $uuid, 'gobblygoop', $mp3data);
+  	$this->assertFalse($ret, t('Submitjob rejects on bad sessid'));		
+		$ret = mp3service_xmlrpc_submitjob($token, 'gobblygoop', $sessid, $mp3data);
+  	$this->assertFalse($ret, t('Submitjob rejects on bad uuid'));		
+  
+		// check for completion
+		$ret = mp3service_xmlrpc_check($token, $uuid);
+		$this->assertEqual($ret['state'], MP3SERVICE_STATE_COMPLETE, t('Website-side check after completion returns COMPLETE status'));
+		$this->assertNotNull($ret['file'], t('Website-side check after completion returns file data: ' . base64_decode($ret['file'])));
+				
+		// deauthorize key
+		_mp3service_deauthorize($token);
+		$this->assertFalse(_mp3service_authenticate($token), t('Deauthorized token is rejected'));
+	}
+	
+	
+	/**
+	 * Tests to exercise the mp3client backend utility functions
+	 */ 
+  function testMp3ServiceUtil() {
+	}
+	
+}
